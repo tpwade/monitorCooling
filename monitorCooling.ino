@@ -23,6 +23,8 @@
 // Power = J/s
 // flowLPM [L/min] * Rho [kg/L] * C [J/kgK] * dTemp [K]
 
+//#define BEEP
+
 
 float flowK = 170.1; // [ pulses / L ]
 float coolantC = 3558.78; // [ J / (kg K) ]
@@ -84,6 +86,12 @@ float powWatts = 0.0;
 //http://forum.arduino.cc/index.php?topic=160480.0
 const byte interruptPin = 3;
 
+
+
+//storage variables
+boolean toggle1 = 0;
+
+
 void flowPulseISR() {
     newestTimeIndx ++;
     newestTimeIndx &= 0x3F;
@@ -127,8 +135,54 @@ void setup() {
             default: Serial.println("Unknown"); break;
         }
     }
+    
+#ifdef BEEP
+  
+  pinMode(7,OUTPUT);
+  digitalWrite(7,LOW);
+  cli();//stop interrupts
+
+//set timer1 interrupt at 1Hz
+// TCCRx = Timer/Counter Control Register.  The prescaler can be configured here.
+// TCNTx = Timer/Counter Register.  The actual timer value is stored here.
+// OCRx = Output compare register
+// ICRx = Input Compare Register
+// TIMSKx = Timer/CounterInterrupt Mask Register.  To enable/disable timer interrupts.
+    TCCR1A = 0;// set entire TCCR1A register to 0
+    TCCR1B = 0;// same for TCCR1B
+    TCNT1  = 0;//initialize counter value to 0
+    // set compare match register for 1hz increments
+    OCR1A = 3906;//15624;// = (16*10^6) / (1*1024) - 1 (must be <65536)
+    // turn on CTC mode
+    TCCR1B |= (1 << WGM12);
+    // Set CS12 and CS10 bits for 1024 prescaler
+    TCCR1B |= (1 << CS12) | (1 << CS10);  
+    // enable timer compare interrupt
+    TIMSK1 |= (1 << OCIE1A);
+
+  
+  sei();//allow interrupts
+
+#endif
   
 }
+
+
+#ifdef BEEP
+ISR(TIMER1_COMPA_vect){//timer1 interrupt 1Hz toggles pin 13 (LED)
+//generates pulse wave of frequency 1Hz/2 = 0.5kHz (takes two cycles for full wave- toggle high then toggle low)
+  if (toggle1){
+    digitalWrite(7,HIGH);
+    toggle1 = 0;
+  }
+  else{
+    digitalWrite(7,LOW);
+    toggle1 = 1;
+  }
+}
+#endif
+
+
 
 void loop() {
   
