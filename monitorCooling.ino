@@ -24,17 +24,21 @@
 // flowLPM [L/min] * Rho [kg/L] * C [J/kgK] * dTemp [K]
 
 //#define BEEP
+//#define DEBUGOUTPUT
 
+char unitsT[ ]="F";     // 'C' or 'F'
+char unitsFlow[ ]="L";  // 'L' for LPM or 'G' for GPM
 
-float flowK = 170.1; // [ pulses / L ]
+float flowK = 170.1;      // [ pulses / L ] 
 float coolantC = 3558.78; // [ J / (kg K) ]
-float coolantRho = 1.041;  // [ kg / L ]
+float coolantRho = 1.041; // [ kg / L ]
 
 float maxLPM = 30.0;  // equivalent to about 8 GPM
-float minLPM = 7.5;  // equivalent to about 2 GPM
-float maxTemp = 40;  // deg C
-float minTemp = 0;  // deg C
+float minLPM = 7.5;   // equivalent to about 2 GPM
+float maxTemp = 40;   // deg C
+float minTemp = 0;    // deg C
 unsigned long maxdeadTime = 2000; // is ms;
+
 
 
 // Use software SPI: CS, DI, DO, CLK
@@ -114,12 +118,21 @@ void setup() {
 
     // for communication back along USB or serial
     Serial.begin(115200);
-    Serial.println("MAX31856 thermocouple test");
-  
-  
-    for (tc_i = 0; tc_i < tc_num; tc_i++){
+    
+    for (tc_i=0; tc_i < tc_num; tc_i++){
         maxTC.begin(tc_cs[tc_i]);
         maxTC.setThermocoupleType(tc_cs[tc_i],tc_type);
+    }
+    
+    if (strcmp(unitsT,"F")==0) {
+        minTemp = (minTemp)*9/5+32;
+        maxTemp = (maxTemp)*9/5+32;
+    }
+    
+#ifdef DEBUGOUTPUT
+    Serial.println("MAX31856 thermocouple test");
+    
+    for (tc_i = 0; tc_i < tc_num; tc_i++){
         Serial.print("Thermocouple type: ");
         switch ( maxTC.getThermocoupleType(tc_cs[tc_i]) ) {
             case MAX31856_TCTYPE_B: Serial.println("B Type"); break;
@@ -135,6 +148,7 @@ void setup() {
             default: Serial.println("Unknown"); break;
         }
     }
+#endif
     
 #ifdef BEEP
   
@@ -185,7 +199,9 @@ ISR(TIMER1_COMPA_vect){//timer1 interrupt 1Hz toggles pin 13 (LED)
 
 
 void loop() {
-  
+
+    char tcLabel[4];
+    char sendBuffer1[17];
     int8_t tc_i;
     uint8_t maxTC_FAULTS;
     float tcTemp;
@@ -215,9 +231,28 @@ void loop() {
     for (tc_i = 0; tc_i < tc_num; tc_i++){
         maxTC.readThermocoupleTemperatureFast(tc_cs[tc_i],&tcTemp,&cjTemp,fastFlag);
         switch (tc_i) {
-            case 0: returnTemp = tcTemp;
-            case 1: supplyTemp = tcTemp;
+            case 0: 
+              supplyTemp = tcTemp;
+              sprintf(tcLabel,"%s","Cld ");
+              break;
+            case 1:
+              returnTemp = tcTemp;
+              sprintf(tcLabel,"%s","Rtn ");
+              break;
+            default:
+              sprintf(tcLabel,"TC%2d","Rtn ");
+              break;
         }
+    
+#ifdef NEVER
+      sprintf(sendBuffer1,"%s(CJ):%3d.%1d %s%2d.%1d<%3d.%1d<%3d.%1d",  
+            tcLabel, (int)cjTemp, (int)(cjTemp*10)%10, "C",       
+            (int)minTemp,(int)(minTemp*10)%10,(int)tcTemp,(int)(tcTemp*10)%10, (int)maxTemp,(int)(maxTemp*10)%10);
+      //sprintf(sendBuffer1,"%s(CJ):", tcLabel);
+      Serial.println(sendBuffer1);
+#endif
+
+#ifdef DEBUGOUTPUT
         Serial.print("TC #: ");
         Serial.print(tc_i);
         Serial.print(" CJ / TC Temp: ");
@@ -225,8 +260,8 @@ void loop() {
         Serial.print(" / ");
         Serial.println(tcTemp);
         //Serial.print(" Thermocouple Temp: "); Serial.println(maxTC.readThermocoupleTemperatureFast(tc_cs[tc_i],&tcTemp,&cjTemp));
+#endif
         
-#ifdef NEVER
         maxTC_FAULTS = maxTC.readFault(tc_cs[tc_i]);
         if (maxTC_FAULTS) {
             if (maxTC_FAULTS & MAX31856_FAULT_CJRANGE) Serial.println("Cold Junction Range Fault");
@@ -237,9 +272,11 @@ void loop() {
             if (maxTC_FAULTS & MAX31856_FAULT_TCLOW)   Serial.println("Thermocouple Low Fault");
             if (maxTC_FAULTS & MAX31856_FAULT_OVUV)    Serial.println("Over/Under Voltage Fault");
             if (maxTC_FAULTS & MAX31856_FAULT_OPEN)    Serial.println("Thermocouple Open Fault");
+            delay(3000); // to put up on SerialMonitor
         }
-#endif
     }
+    
+    
     
 /* tic toc stuff */
 #ifdef NEVER
@@ -260,7 +297,8 @@ void loop() {
              // 1000 ms in second
 
     powWatts = flowLPM * coolantRho * coolantC * (returnTemp-supplyTemp) / 60;
-    
+
+ #ifdef DEBUGOUTPUT
     Serial.print(newestTimeIndx);
     Serial.print(", ");
     Serial.print(oldestTimeIndx);
@@ -276,6 +314,7 @@ void loop() {
 
     Serial.print("Thermal Power (W): ");
     Serial.println(powWatts);
+#endif
     
     // if we haven't had a flow pulse in 2 seconds, assume the flow sensor is dead or not spinning
     // don't base it on the newestTimeIndex since this on occasion may get updated after currentMillis is updated due to interrupt (leading to a negative number that wraps and isn't handled well)
@@ -308,7 +347,34 @@ void loop() {
         Serial.print(" WARNING: Flow is under ");
         Serial.println(minLPM);
     }
+    
+    if (strcmp(unitsT,"F")==0) {
+        supplyTemp = (supplyTemp)*9/5+32;
+        returnTemp = (returnTemp)*9/5+32;
+    }
+    
+    //if (returnTemp >= maxTemp) {
+    //} else if (returnTemp <= minTemp) {
+    //} else {
+    sprintf(sendBuffer1,"Cld,Rtn,Max,deg%s%2d.%1d,%3d.%1d,%3d.%1d",unitsT,
+        (int)supplyTemp,(int)(supplyTemp*10)%10,
+        (int)returnTemp,(int)(returnTemp*10)%10,
+        (int)maxTemp,(int)(maxTemp*10)%10);
+        Serial.print(sendBuffer1);
         
+    sprintf(sendBuffer1,"Cld,Rtn,Max,deg%s%2d.%1d,%3d.%1d,%3d.%1d",unitsT,
+        (int)supplyTemp,(int)(supplyTemp*10)%10,
+        (int)returnTemp,(int)(returnTemp*10)%10,
+        (int)maxTemp,(int)(maxTemp*10)%10);
+        Serial.print(sendBuffer1);
+    //}
+            
+    //sprintf(sendBuffer,"%s(CJ):%3d.%1d %s%2d.%1d<%3d.%1d<%3d.%1d",  
+    //    tcLabel, (int)cjTemp, (int)(cjTemp*10)%10, "C",       
+    //    (int)minTemp,(int)(minTemp*10)%10,(int)tcTemp,(int)(tcTemp*10)%10, (int)maxTemp,(int)(maxTemp*10)%10);
+    //sprintf(sendBuffer,"%s(CJ):", tcLabel);
+    //Serial.println(sendBuffer);
+    
     // overtemp warning
     if (returnTemp >= maxTemp) {
         allGood = 0;
@@ -334,7 +400,7 @@ void loop() {
     
     
     
-#ifdef NEVER
+#ifdef DEBUGOUTPUT
     for (tc_i = 0; tc_i < tc_num; tc_i++){
         Serial.print("Cold Junction Temp: "); Serial.println(maxTC.readCJTemperature(tc_cs[tc_i]));
         
@@ -380,3 +446,4 @@ void loop() {
 // 1L in 12.91 when reading 4.45 LPM
 //       12.74
 //       12.82
+
