@@ -14,27 +14,40 @@
 //   https://www.engineeringtoolbox.com/propylene-glycol-d_363.html
 // 
 // trip points:
-// maxLPM
-// minLPM
+// maxFlow
+// minFlow
 // maxTemp [celcius]
 //   temperature on return line at which to trip 
 // maxQ (maximum heat, probably don't use)
 //
 // Power = J/s
-// flowLPM [L/min] * Rho [kg/L] * C [J/kgK] * dTemp [K]
+// flow [L/min] * Rho [kg/L] * C [J/kgK] * dTemp [K]
 
 //#define BEEP
-//#define DEBUGOUTPUT
+#define DEBUGOUTPUT
 
-char unitsT[ ]="F";     // 'C' or 'F'
-char unitsFlow[ ]="L";  // 'L' for LPM or 'G' for GPM
+#define TC_SPI_MOSI 11 
+#define TC_SPI_MISO 12
+#define TC_SPI_CLK 13
+#define TC_CS_COLD 9
+#define TC_CS_RETURN 10
+#define LED_FAULT 4
+#define LED_ALL_GOOD 5
+#define BUZZER 6
 
-float flowK = 170.1;      // [ pulses / L ] 
+//char unitsT='F';  // does not work with sprintf due to it not having end of string character
+char unitsT[ ]="C";     // "C" or "F"
+char unitsFlow[ ]="L";  // "L" for LPM or "G" for GPM
+
+float flowK = 117.3;      // [ pulses / L ] 
+//            170.1 [pulses / L] for robarts (calibrated at Robarts Tap)
+//        k = 444   [pulses / G] calibration report for NIH flowmeter
+//          = 117.3 [pulses / L] (444 / G converted)
 float coolantC = 3558.78; // [ J / (kg K) ]
 float coolantRho = 1.041; // [ kg / L ]
 
-float maxLPM = 30.0;  // equivalent to about 8 GPM
-float minLPM = 7.5;   // equivalent to about 2 GPM
+float maxFlow = 30.0;  // equivalent to about 8 GPM
+float minFlow = 3.0;//7.5;   //Col equivalent to about 2 GPM
 float maxTemp = 40;   // deg C
 float minTemp = 0;    // deg C
 unsigned long maxdeadTime = 2000; // is ms;
@@ -48,14 +61,22 @@ unsigned long maxdeadTime = 2000; // is ms;
 //Adafruit_MAX31856 max = Adafruit_MAX31856(10);
 
 uint8_t tc_type = MAX31856_TCTYPE_E;
-// set it up to read up to 16 thermocouples.  For now will use only two, but it nice 
+// set it up to read up to 16 thermocouples.  For now will use only two, but it's nice 
 // to have this for future expansion?
 int8_t tc_num = 2;
-int8_t tc_cs[16] = {9, 10, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10};
+int8_t tc_cs[16] = {TC_CS_COLD, TC_CS_RETURN, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10, 9, 10};
 float tc_temp[16];
 int8_t fastFlag = 1;
 
-Adafruit_MAX31856 maxTC = Adafruit_MAX31856(11, 12, 13);
+
+Adafruit_MAX31856 maxTC = Adafruit_MAX31856(TC_SPI_MOSI, TC_SPI_MISO, TC_SPI_CLK);
+
+// interrupt pin for detecting flow pulses
+//https://www.arduino.cc/reference/en/language/functions/external-interrupts/attachinterrupt/
+//http://gammon.com.au/interrupts
+//http://forum.arduino.cc/index.php?topic=160480.0
+const byte interruptPin = 3;
+
 
 // some variables to play around with timing
 unsigned long startMillis;  //some global variables available anywhere in the program
@@ -77,30 +98,32 @@ unsigned long lastMeasurementTime = 0;
 unsigned long measurementTime = 1000; // make a measurement every 1000 ms
 
 unsigned long dTime; // time between 1st and last pulse in buffer in ms
-//float flowGPM;
-float flowLPM;
-
-// initialize to condidition that might cause fault
-float supplyTemp =  0.0;
-float returnTemp = 100.0;
-float powWatts = 0.0;
-
-//https://www.arduino.cc/reference/en/language/functions/external-interrupts/attachinterrupt/
-//http://gammon.com.au/interrupts
-//http://forum.arduino.cc/index.php?topic=160480.0
-const byte interruptPin = 3;
 
 
 
-//storage variables
+// initialize variables to condidition that might cause fault
+float flow = 0;          // assume units of LPM, and convert if unitsFlow = "G"
+float supplyTemp =  0.0; // assume units of C, and convert if unitsT = "F"
+float returnTemp = 100.0; // assume units of C, and convert if unitsT = "F"
+float powWatts = 0.0;    // in Watts
+
+
+// for buzzer on/off
 boolean toggle1 = 0;
 
 
+// flow interrupt routine
+// keeps track of a buffer containing last 64 pulses
+// [   0 |   1 |   2 |   3 | ....|  64  ]
+// [ 4481| 4651|  678|  987| ....| 4278 ]
+//           |     |____ oldestTimeIndex
+//           |__________ newestTimeIndex
+// each time bump the index forward one and update the newest time
 void flowPulseISR() {
     newestTimeIndx ++;
-    newestTimeIndx &= 0x3F;
+    newestTimeIndx &= 0x3F; // keep just lower 6 bits 
     oldestTimeIndx ++;
-    oldestTimeIndx &= 0x3F;
+    oldestTimeIndx &= 0x3F; // keep just lower 6 bits
     timingBuff[newestTimeIndx] = millis();
 }
 
@@ -109,24 +132,50 @@ void setup() {
     int8_t tc_i;
     
     
+    
+    
     startMillis = millis();  //initial start time
     
-    
+    // attach internal pullup and inturrupt for detecting pulses of flow meter
     pinMode(interruptPin, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(interruptPin), flowPulseISR, FALLING);
     
-
     // for communication back along USB or serial
     Serial.begin(115200);
     
+    // initialize thermocouples 
     for (tc_i=0; tc_i < tc_num; tc_i++){
         maxTC.begin(tc_cs[tc_i]);
         maxTC.setThermocoupleType(tc_cs[tc_i],tc_type);
     }
     
+    
+/* self Check */
+    pinMode(LED_FAULT,OUTPUT);
+    pinMode(LED_ALL_GOOD,OUTPUT);
+    pinMode(BUZZER,OUTPUT);
+    digitalWrite(LED_FAULT,HIGH);
+    digitalWrite(LED_ALL_GOOD,HIGH);
+    digitalWrite(BUZZER,HIGH);
+    Serial.println("Gradient Thermal* Monitor v1.0 *");
+    
+    delay(100);
+    digitalWrite(BUZZER,LOW);
+    delay(2000);
+    digitalWrite(LED_FAULT,LOW);
+    digitalWrite(LED_ALL_GOOD,LOW);
+/* end selfCheck*/
+
+    // unit conversion if relevant
+    //if (unitsT=='F') {
     if (strcmp(unitsT,"F")==0) {
         minTemp = (minTemp)*9/5+32;
         maxTemp = (maxTemp)*9/5+32;
+    }
+    
+    if (strcmp(unitsFlow,"G")==0) {
+        minFlow = minFlow / 3.7854118;
+        maxFlow = maxFlow / 3.7854118;
     }
     
 #ifdef DEBUGOUTPUT
@@ -201,13 +250,18 @@ ISR(TIMER1_COMPA_vect){//timer1 interrupt 1Hz toggles pin 13 (LED)
 void loop() {
 
     char tcLabel[4];
-    char sendBuffer1[17];
+    char sendBuffer1[33];
     int8_t tc_i;
     uint8_t maxTC_FAULTS;
     float tcTemp;
     float cjTemp;
     volatile unsigned long deadTime;
     uint8_t allGood;
+    float supplyCJ, returnCJ;
+    
+    // for conversion of currentMillis to hhh:mm:ss.x format
+    long timeRem;  // remainder after parseing off each larger unit
+    int hh, mm, ss, ds;
     
     //newestTimeIndx ++;
     //newestTimeIndx &= 0x3F;
@@ -217,15 +271,16 @@ void loop() {
     
     
     // trigger all TC boards to make a single TC measurement
-    // this prep takes about 1ms per TC
+    // this prep takes about 1ms per TC and then according to the manual:
+    //"A single conversion requires approximately 143ms in 60Hz filter mode
+    // or 169ms in 50Hz filter mode to complete. This bit self clears to 0."
+    // so add a 250 ms delay after trigger for conversion to complete
     for (tc_i = 0; tc_i < tc_num; tc_i++){
         maxTC.oneShotTemperature(tc_cs[tc_i],fastFlag);
     }
-    // A single conversion requires approximately 143ms in 60Hz filter mode
-    // or 169ms in 50Hz filter mode to complete. This bit self clears to 0.
-    delay(250); // MEME FIX autocalculate based on oversampling
+    delay(250);
     
-    currentMillis = millis();  //get the current "time" (actually the number of milliseconds since the program started)
+    currentMillis = millis();  //get the current "time" (milliseconds since the program started)
     // with the Serial.print's this loop takes about 2ms per TC 
     // without the Serial.prints it's about 1ms per TC
     for (tc_i = 0; tc_i < tc_num; tc_i++){
@@ -233,10 +288,12 @@ void loop() {
         switch (tc_i) {
             case 0: 
               supplyTemp = tcTemp;
+              supplyCJ   = cjTemp;
               sprintf(tcLabel,"%s","Cld ");
               break;
             case 1:
               returnTemp = tcTemp;
+              returnCJ   = cjTemp;
               sprintf(tcLabel,"%s","Rtn ");
               break;
             default:
@@ -244,13 +301,6 @@ void loop() {
               break;
         }
     
-#ifdef NEVER
-      sprintf(sendBuffer1,"%s(CJ):%3d.%1d %s%2d.%1d<%3d.%1d<%3d.%1d",  
-            tcLabel, (int)cjTemp, (int)(cjTemp*10)%10, "C",       
-            (int)minTemp,(int)(minTemp*10)%10,(int)tcTemp,(int)(tcTemp*10)%10, (int)maxTemp,(int)(maxTemp*10)%10);
-      //sprintf(sendBuffer1,"%s(CJ):", tcLabel);
-      Serial.println(sendBuffer1);
-#endif
 
 #ifdef DEBUGOUTPUT
         Serial.print("TC #: ");
@@ -274,7 +324,7 @@ void loop() {
             if (maxTC_FAULTS & MAX31856_FAULT_OPEN)    Serial.println("Thermocouple Open Fault");
             delay(3000); // to put up on SerialMonitor
         }
-    }
+    } // end of tc_i thermocouple reading loop
     
     
     
@@ -289,16 +339,15 @@ void loop() {
 #endif
 /* */
 
-
     dTime = timingBuff[newestTimeIndx]-timingBuff[oldestTimeIndx];
-    flowLPM = 64.0 * 60 * 1000 / (flowK * (float)dTime);
-             // 64 pulses in timing buffer
+    flow = 64.0 * 60 * 1000 / (flowK * (float)dTime);
+             // 64 pulses in timing buffer (or should it be 64-1?)
              // 60 seconds in minute
              // 1000 ms in second
 
-    powWatts = flowLPM * coolantRho * coolantC * (returnTemp-supplyTemp) / 60;
+    powWatts = flow * coolantRho * coolantC * (returnTemp-supplyTemp) / 60;
 
- #ifdef DEBUGOUTPUT
+#ifdef DEBUGOUTPUT
     Serial.print(newestTimeIndx);
     Serial.print(", ");
     Serial.print(oldestTimeIndx);
@@ -310,7 +359,7 @@ void loop() {
     Serial.println(dTime);
 
     Serial.print("Flow LPM: ");
-    Serial.println(flowLPM);
+    Serial.println(flow);
 
     Serial.print("Thermal Power (W): ");
     Serial.println(powWatts);
@@ -323,11 +372,87 @@ void loop() {
     tempTimeIndx &=0x3F;
     deadTime = currentMillis - timingBuff[tempTimeIndx];
     
+    // unit conversion if relevant
+    if (strcmp(unitsT,"F")==0) {
+        supplyCJ = (supplyCJ)*9/5+32;
+        returnCJ = (returnCJ)*9/5+32;
+        supplyTemp = (supplyTemp)*9/5+32;
+        returnTemp = (returnTemp)*9/5+32;
+    }
+    if (strcmp(unitsFlow,"G")==0) {
+        flow = flow / 3.7854118;
+        flow = flow / 3.7854118;
+    }
+    
+    delay(650);
+    
+    if (deadTime >= maxdeadTime) {
+        flow = 0.0;
+    }
+    
+    
+    // now print the serial output for display and logging
+    // when connected to a serial monitor (another arduino with 2x16 character
+    // display) it will be set up to display the first 64 characters, 
+    // representing 2 screens:
+    // (1) Sup,Rtn,Max degC
+    //     xx.x xxx.x/xxx.x
+    // (2) LPM: xx.0 / 60.0
+    //      12:34.56 16000W
+    
+    sprintf(sendBuffer1,"Cld, Rtn, Max o%s%2d.%1d,%3d.%1d,%3d.%1d",unitsT,
+        (int)supplyTemp,(int)(supplyTemp*10)%10,
+        (int)returnTemp,(int)(returnTemp*10)%10,
+        (int)maxTemp,(int)(maxTemp*10)%10);
+    Serial.print(sendBuffer1);
+    
+    // not sure there is enough precesion in the round(float)
+    // to bother with rounding over truncation
+    timeRem = currentMillis/100; //to get to deci-seconds
+    hh = (int)(timeRem/((long)60*60*10)); timeRem = timeRem%((long)60*60*10);
+    mm = (int)(timeRem/((long)60*10));    timeRem = timeRem%((long)60*10);
+    ss = (int)(timeRem/10);               timeRem = timeRem%10;
+    ds = (int)timeRem; // just 1 decimal
+    sprintf(sendBuffer1,"%sPM:%3d.%1d /%3d.%1d%3d:%02d:%02d%6ldW",unitsFlow,
+        (int)flow,(int)(flow*10)%10,
+        (int)minFlow,(int)(minFlow*10)%10,
+        hh,mm,ss, (long)powWatts);
+    Serial.print(sendBuffer1);
+    
+    // time to send above 64 characters is
+    // (1000ms / 115200 bps) * 8 * 64 = roughly 4-6 ms
+    // (8 might need to be changed to 10 to add start/stop bits)
+
+    delay(50); // to give receiver time to catch up
+
+    sprintf(sendBuffer1,", %10lu,%3d.%1d,%3d.%1d,",currentMillis,
+            (int)supplyCJ,(int)(supplyCJ*10)%10,
+            (int)supplyTemp,(int)(supplyTemp*10)%10);
+    Serial.print(sendBuffer1);
+    delay(10); // to give receiver time to catch up
+    sprintf(sendBuffer1,"%3d.%1d,%3d.%1d,%3d.%1d,%3d.%1d,",
+            (int)returnCJ,(int)(returnCJ*10)%10,
+            (int)returnTemp,(int)(returnTemp*10)%10,
+            (int)minTemp,(int)(minTemp*10)%10,
+            (int)maxTemp,(int)(maxTemp*10)%10);
+    Serial.print(sendBuffer1);
+    delay(10); // to give receiver time to catch up
+    sprintf(sendBuffer1,"%3d.%1d,%3d.%1d,%3d.%1d,%6ld.%1d,%s,%s",
+            (int)flow,(int)(flow*10)%10,
+            (int)minFlow,(int)(minFlow*10)%10,
+            (int)maxFlow,(int)(maxFlow*10)%10,
+            (long)powWatts,abs((int)(powWatts*10)%10),
+            unitsT,unitsFlow);
+    Serial.println(sendBuffer1);
+
+
+    
+    
     allGood = 1;
     
     if (deadTime >= maxdeadTime) {
         allGood = 0;
-        Serial.print(" WARNING: No flow detected in ");
+        Serial.print("WARNING: No flow detected in ");
         Serial.println(maxdeadTime);
         Serial.print(currentMillis);
         Serial.print(" - ");
@@ -336,44 +461,19 @@ void loop() {
         Serial.println(deadTime);
     }
     // overflow warning
-    else if (flowLPM >= maxLPM) {
+    else if (flow >= maxFlow) {
         allGood = 0;
         Serial.print(" WARNING: Flow exceeds ");
-        Serial.println(maxLPM);
+        Serial.println(maxFlow);
     }
     // underflow warning
-    else if (flowLPM <= minLPM) {
+    else if (flow <= minFlow) {
         allGood = 0;
         Serial.print(" WARNING: Flow is under ");
-        Serial.println(minLPM);
+        Serial.println(minFlow);
     }
     
-    if (strcmp(unitsT,"F")==0) {
-        supplyTemp = (supplyTemp)*9/5+32;
-        returnTemp = (returnTemp)*9/5+32;
-    }
-    
-    //if (returnTemp >= maxTemp) {
-    //} else if (returnTemp <= minTemp) {
-    //} else {
-    sprintf(sendBuffer1,"Cld,Rtn,Max,deg%s%2d.%1d,%3d.%1d,%3d.%1d",unitsT,
-        (int)supplyTemp,(int)(supplyTemp*10)%10,
-        (int)returnTemp,(int)(returnTemp*10)%10,
-        (int)maxTemp,(int)(maxTemp*10)%10);
-        Serial.print(sendBuffer1);
-        
-    sprintf(sendBuffer1,"Cld,Rtn,Max,deg%s%2d.%1d,%3d.%1d,%3d.%1d",unitsT,
-        (int)supplyTemp,(int)(supplyTemp*10)%10,
-        (int)returnTemp,(int)(returnTemp*10)%10,
-        (int)maxTemp,(int)(maxTemp*10)%10);
-        Serial.print(sendBuffer1);
-    //}
             
-    //sprintf(sendBuffer,"%s(CJ):%3d.%1d %s%2d.%1d<%3d.%1d<%3d.%1d",  
-    //    tcLabel, (int)cjTemp, (int)(cjTemp*10)%10, "C",       
-    //    (int)minTemp,(int)(minTemp*10)%10,(int)tcTemp,(int)(tcTemp*10)%10, (int)maxTemp,(int)(maxTemp*10)%10);
-    //sprintf(sendBuffer,"%s(CJ):", tcLabel);
-    //Serial.println(sendBuffer);
     
     // overtemp warning
     if (returnTemp >= maxTemp) {
@@ -388,8 +488,18 @@ void loop() {
         Serial.print(" WARNING: Return Temperature is under ");
         Serial.println(minTemp);
     }
-    
-    
+
+    if (allGood == 1) {
+        digitalWrite(LED_FAULT,LOW);
+        digitalWrite(LED_ALL_GOOD,HIGH);
+        digitalWrite(BUZZER,LOW);
+    } else {
+        digitalWrite(LED_FAULT,HIGH);
+        digitalWrite(LED_ALL_GOOD,LOW);
+        digitalWrite(BUZZER,HIGH);
+        
+    }
+#ifdef DEBUGOUTPUT
     if (allGood == 1) {
         // all good, light up green LED
         Serial.println("ALL GOOD");
@@ -397,31 +507,10 @@ void loop() {
         // something is wrong, light up red LED and audible warning.
         Serial.println("ERRORS detected, see above");
     }
-    
-    
-    
-#ifdef DEBUGOUTPUT
-    for (tc_i = 0; tc_i < tc_num; tc_i++){
-        Serial.print("Cold Junction Temp: "); Serial.println(maxTC.readCJTemperature(tc_cs[tc_i]));
-        
-        Serial.print(" Thermocouple Temp: "); Serial.println(maxTC.readThermocoupleTemperature(tc_cs[tc_i]));
-        // Check and print any faults
-        maxTC_FAULTS = maxTC.readFault(tc_cs[tc_i]);
-        if (maxTC_FAULTS) {
-            if (maxTC_FAULTS & MAX31856_FAULT_CJRANGE) Serial.println("Cold Junction Range Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_TCRANGE) Serial.println("Thermocouple Range Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_CJHIGH)  Serial.println("Cold Junction High Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_CJLOW)   Serial.println("Cold Junction Low Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_TCHIGH)  Serial.println("Thermocouple High Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_TCLOW)   Serial.println("Thermocouple Low Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_OVUV)    Serial.println("Over/Under Voltage Fault");
-            if (maxTC_FAULTS & MAX31856_FAULT_OPEN)    Serial.println("Thermocouple Open Fault");
-        }
-   }
 #endif
+    
  
   
-  delay(750);
 }
 
 
@@ -447,3 +536,10 @@ void loop() {
 //       12.74
 //       12.82
 
+// output pins are limited to roughly 40 mA
+// red LED (Dialight 657-2502-103F) is 20mA @ 5VDC, 400FL
+// green LED (Dialight 657-2602-103F) is 20mA @ 5VDC, 400FL
+// protective resistor: R = 5/0.04 =125 ohm
+// even with 220 ohm resistor in line, seems to still be quite bright
+// D4/D5/D6 = Red/Green/buzzer (note might want D7 for buzzer with interrupts)
+ 
